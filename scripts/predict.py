@@ -90,22 +90,34 @@ def main():
         )
 
     save_dir = args.save_dir
-    # 保存先は「実行時のカレントディレクトリ」からの相対パスです。
-    # プロジェクトルートの results/ に保存したい場合は、プロジェクトルートで実行するか
-    # --save-dir results のまま python scripts/predict.py を実行してください。
+    return run_predict(
+        weights=weights,
+        source=source,
+        save_dir=save_dir,
+        imgsz=args.imgsz,
+        conf=args.conf,
+    )
+
+
+def run_predict(
+    weights,
+    source,
+    save_dir="results",
+    imgsz=640,
+    conf=0.25,
+):
+    """YOLO推論を実行し、results オブジェクトを返す（segment_SAM 等から呼び出し用）。"""
     # ultralytics は project/name に画像を保存するため、project='.', name=save_dir で指定
     model = YOLO(weights)
     results = model.predict(
         source=source,
-        imgsz=args.imgsz,
-        conf=args.conf,
+        imgsz=imgsz,
+        conf=conf,
         save=True,
         project=".",
         name=save_dir,
         exist_ok=True,
     )
-
-    # 画像は save_dir（例: results/）に保存されます
     print(f"[INFO] 推論結果の画像を保存しました: {Path(save_dir).resolve()}")
     return results
 
