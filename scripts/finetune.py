@@ -1,5 +1,5 @@
 """
-YOLO11s ファインチューニングスクリプト（家具あり難しい図面 15 件）
+YOLO11s ファインチューニングスクリプト（家具あり難しい図面 14 件）
 
 - 学習済み重み: /kaggle/working/runs/detect/train/weights/best.pt
 - 追加データ: /kaggle/working/difficult_annotation/image/ (.png) + labels/ (.txt, YOLO形式, door/window/zone)

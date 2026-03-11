@@ -1,2 +1,7 @@
 # Kaggle input data (train, valid, test 等の大量データはプッシュしない)
 kaggle/input/
+cubicasa5k_processed/
+
+# 大量データ・アーカイブ（pushしない）
+archive*/
+archive (1)/
