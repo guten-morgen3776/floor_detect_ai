@@ -5,3 +5,4 @@ cubicasa5k_processed/
 # 大量データ・アーカイブ（pushしない）
 archive*/
 archive (1)/
+*.zip
