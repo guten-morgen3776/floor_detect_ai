@@ -17,6 +17,38 @@ from ultralytics.models.sam import Predictor as SAMPredictor
 # ※環境に合わせて import を調整してください
 from predict import run_predict
 
+# ============================================================
+# CONFIG: パスやパラメータをここにまとめて記載（書き換え容易化）
+# ============================================================
+CONFIG = {
+    # --- パス（プロジェクトルートからの相対パス） ---
+    "weights_relpath": "runs/detect/train/weights/best.pt",
+    "source_relpath": (
+        "kaggle/input/datasets/umairinayat/"
+        "floor-plans-500-annotated-object-detection/archive-3/test/images"
+    ),
+    "save_dir": "results",
+    "output_dir": "segment_results",
+    "sam_model": "sam2-b.pt",
+    # --- YOLO推論パラメータ ---
+    "imgsz": 640,
+    "conf": 0.25,
+    # --- SAM Predictor パラメータ ---
+    "sam_conf": 0.25,
+    "sam_imgsz": 1024,
+    # --- セグメント処理パラメータ ---
+    "zone_margin": 10.0,
+    "morph_kernel": 30,
+    "epsilon_rate": 0.002,
+    # --- 描画パラメータ ---
+    "overlay_alpha": 0.4,
+    "colors": [
+        (255, 100, 100), (100, 255, 100), (100, 100, 255),
+        (255, 255, 100), (255, 100, 255), (100, 255, 255),
+    ],
+}
+# ============================================================
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -29,28 +61,28 @@ def parse_args():
         "--source", type=str, default=None, help="推論対象の画像フォルダ（test/images/）"
     )
     parser.add_argument(
-        "--save-dir", type=str, default="results", help="YOLO推論結果の保存先"
+        "--save-dir", type=str, default=CONFIG["save_dir"], help="YOLO推論結果の保存先"
     )
     parser.add_argument(
-        "--output-dir", type=str, default="segment_results", help="SAMセグメント結果の保存先"
+        "--output-dir", type=str, default=CONFIG["output_dir"], help="SAMセグメント結果の保存先"
     )
     parser.add_argument(
-        "--sam-model", type=str, default="sam2-b.pt", help="SAMモデル"
+        "--sam-model", type=str, default=CONFIG["sam_model"], help="SAMモデル"
     )
     parser.add_argument(
-        "--imgsz", type=int, default=640, help="YOLO推論時の画像サイズ"
+        "--imgsz", type=int, default=CONFIG["imgsz"], help="YOLO推論時の画像サイズ"
     )
     parser.add_argument(
-        "--conf", type=float, default=0.25, help="YOLO検出の信頼度閾値"
+        "--conf", type=float, default=CONFIG["conf"], help="YOLO検出の信頼度閾値"
     )
     parser.add_argument(
-        "--zone-margin", type=float, default=10.0, help="ゾーン内のドア・窓判定用マージン"
+        "--zone-margin", type=float, default=CONFIG["zone_margin"], help="ゾーン内のドア・窓判定用マージン"
     )
     parser.add_argument(
-        "--morph-kernel", type=int, default=30, help="モルフォロジー変換のカーネルサイズ"
+        "--morph-kernel", type=int, default=CONFIG["morph_kernel"], help="モルフォロジー変換のカーネルサイズ"
     )
     parser.add_argument(
-        "--epsilon-rate", type=float, default=0.002, help="頂点数削減の平滑化パラメータ"
+        "--epsilon-rate", type=float, default=CONFIG["epsilon_rate"], help="頂点数削減の平滑化パラメータ"
     )
     return parser.parse_args()
 
@@ -58,16 +90,13 @@ def parse_args():
 def get_default_weights():
     script_dir = Path(__file__).resolve().parent
     project_root = script_dir.parent
-    return str(project_root / "runs/detect/train/weights/best.pt")
+    return str(project_root / CONFIG["weights_relpath"])
 
 
 def get_default_source():
     script_dir = Path(__file__).resolve().parent
     project_root = script_dir.parent
-    return str(
-        project_root
-        / "kaggle/input/datasets/umairinayat/floor-plans-500-annotated-object-detection/archive-3/test/images"
-    )
+    return str(project_root / CONFIG["source_relpath"])
 
 
 def extract_prompts_from_result(r, zone_margin: float = 10.0):
@@ -234,13 +263,10 @@ def main():
     )
 
     print(f"[INFO] SAMモデルを読み込み中: {args.sam_model}")
-    overrides = dict(conf=0.25, task="segment", mode="predict", imgsz=1024, model=args.sam_model)
+    overrides = dict(conf=CONFIG["sam_conf"], task="segment", mode="predict", imgsz=CONFIG["sam_imgsz"], model=args.sam_model)
     predictor = SAMPredictor(overrides=overrides)
 
-    colors = [
-        (255, 100, 100), (100, 255, 100), (100, 100, 255),
-        (255, 255, 100), (255, 100, 255), (100, 255, 255),
-    ]
+    colors = CONFIG["colors"]
 
     for i, r in enumerate(results):
         orig_img = r.orig_img
@@ -299,7 +325,7 @@ def main():
             global_occupancy = cv2.bitwise_or(global_occupancy, resolved_mask)
             
             # 引き算済みのマスクを使って描画
-            overlay_img = draw_overlay_from_mask(overlay_img, resolved_mask, info["color"], alpha=0.4)
+            overlay_img = draw_overlay_from_mask(overlay_img, resolved_mask, info["color"], alpha=CONFIG["overlay_alpha"])
 
         # JSONの出力順を元のインデックス順に戻す
         polygons_all.sort(key=lambda x: x["zone_index"])

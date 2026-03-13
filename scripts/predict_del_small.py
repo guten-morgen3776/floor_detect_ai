@@ -2,16 +2,18 @@
 YOLOv11 推論・可視化スクリプト（建物見取り図データセット用）
 - 学習で得た best.pt を読み込み、test/images/ に対して推論
 - バウンディングボックス描画済み画像を results/ に保存
+- "zone" クラスかつ面積が閾値以下のボックスを除去
 
 パスについて:
   - デフォルトの weights / source は「このスクリプトの位置」からプロジェクトルートを推定しています。
-  - 実行はプロジェクトルートから推奨: python scripts/predict.py
+  - 実行はプロジェクトルートから推奨: python scripts/predict_del_small.py
   - その場合、結果は ./results/ に保存され、test 画像は kaggle/input/.../archive-3/test/images を参照します。
 """
 
 import argparse
 from pathlib import Path
 
+import cv2
 from ultralytics import YOLO
 
 # ============================================================
@@ -28,6 +30,8 @@ CONFIG = {
     # --- 推論パラメータ ---
     "imgsz": 640,
     "conf": 0.25,
+    # --- 小面積zoneボックス除去の閾値（ピクセル面積） ---
+    "area_threshold": 10000,
 }
 # ============================================================
 
@@ -64,6 +68,12 @@ def parse_args():
         default=CONFIG["conf"],
         help="検出の信頼度閾値（デフォルト: 0.25）",
     )
+    parser.add_argument(
+        "--area-threshold",
+        type=float,
+        default=CONFIG["area_threshold"],
+        help="zoneクラスのボックス面積閾値（ピクセル単位）。これ以下のzoneボックスを除去（デフォルト: 10000）",
+    )
     return parser.parse_args()
 
 
@@ -79,6 +89,43 @@ def get_default_source():
     script_dir = Path(__file__).resolve().parent
     project_root = script_dir.parent
     return str(project_root / CONFIG["source_relpath"])
+
+
+def filter_small_zone_boxes(results, area_threshold, save_dir):
+    """zoneクラスかつ面積が閾値以下のボックスを除去し、該当画像を再保存する。"""
+    total_removed = 0
+    for result in results:
+        boxes = result.boxes
+        if boxes is None or len(boxes) == 0:
+            continue
+
+        names = result.names
+        keep = []
+        removed = 0
+        for i in range(len(boxes)):
+            cls_id = int(boxes.cls[i])
+            cls_name = names[cls_id]
+            x1, y1, x2, y2 = boxes.xyxy[i].tolist()
+            area = (x2 - x1) * (y2 - y1)
+
+            if cls_name == "zone" and area <= area_threshold:
+                removed += 1
+                continue
+            keep.append(i)
+
+        if removed > 0:
+            result.boxes = boxes[keep]
+            img = result.plot()
+            save_path = Path(save_dir) / Path(result.path).name
+            cv2.imwrite(str(save_path), img)
+            print(
+                f"[INFO] {Path(result.path).name}: "
+                f"zone小面積ボックス {removed}個除去 (閾値={area_threshold:.0f}px²)"
+            )
+            total_removed += removed
+
+    print(f"[INFO] 合計 {total_removed}個の小面積zoneボックスを除去しました")
+    return results
 
 
 def main():
@@ -110,6 +157,7 @@ def main():
         save_dir=save_dir,
         imgsz=args.imgsz,
         conf=args.conf,
+        area_threshold=args.area_threshold,
     )
 
 
@@ -119,9 +167,9 @@ def run_predict(
     save_dir="results",
     imgsz=640,
     conf=0.25,
+    area_threshold=10000,
 ):
-    """YOLO推論を実行し、results オブジェクトを返す（segment_SAM 等から呼び出し用）。"""
-    # ultralytics は project/name に画像を保存するため、project='.', name=save_dir で指定
+    """YOLO推論を実行し、小面積zoneボックスを除去した results オブジェクトを返す。"""
     model = YOLO(weights)
     results = model.predict(
         source=source,
@@ -133,6 +181,10 @@ def run_predict(
         exist_ok=True,
     )
     print(f"[INFO] 推論結果の画像を保存しました: {Path(save_dir).resolve()}")
+
+    print(f"[INFO] 小面積zoneボックス除去を開始 (閾値={area_threshold:.0f}px²)")
+    results = filter_small_zone_boxes(results, area_threshold, save_dir)
+
     return results
 
 
