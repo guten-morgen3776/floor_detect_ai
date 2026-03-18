@@ -3,6 +3,7 @@ kaggle/input/
 cubicasa5k_processed/
 scripts/my_cubicasa_dataset/
 my_cubicasa_dataset/
+cubicasa5k_pix2pix
 
 # 大量データ・アーカイブ（pushしない）
 archive*/
