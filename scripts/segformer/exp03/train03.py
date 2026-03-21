@@ -36,7 +36,7 @@ from albumentations.pytorch import ToTensorV2
 IS_KAGGLE = os.environ.get("KAGGLE_KERNEL_RUN_TYPE") is not None
 
 # ── Config ────────────────────────────────────────────────────────────────────
-MODEL_ID = "nvidia/segformer-b3-finetuned-ade-512-512"
+MODEL_ID = "nvidia/segformer-b2-finetuned-ade-512-512"
 
 if IS_KAGGLE:
     DATA_ROOT  = Path("/kaggle/input/cubicasa_segment")
@@ -53,7 +53,7 @@ BATCH_SIZE    = 4
 NUM_EPOCHS    = 50
 LR            = 6e-5
 WEIGHT_DECAY  = 1e-4
-EARLY_STOP    = 5          # patience
+EARLY_STOP    = 10          # patience
 NUM_WORKERS   = 4
 NUM_LABELS    = 2          # 0=background, 1=room
 
@@ -155,12 +155,42 @@ class HybridLoss(nn.Module):
         return self.weight_focal * loss_focal + self.weight_dice * loss_dice
 
 
+# ── Huge-image filter ─────────────────────────────────────────────────────────
+MAX_W = 5000
+MAX_H = 4000
+
+def filter_huge_images(img_dir: Path, names: list[str]) -> list[str]:
+    """Return names with w <= MAX_W and h <= MAX_H.
+
+    Images and masks share identical filenames, so filtering the names list
+    once keeps both lists in sync — no index drift is possible.
+
+    Args:
+        img_dir: directory that contains the image files (used for size check).
+        names:   sorted list of filenames (shared by images and masks).
+
+    Returns:
+        Filtered list of filenames.
+    """
+    kept = []
+    skipped = 0
+    for name in names:
+        w, h = Image.open(img_dir / name).size   # reads header only, no pixel data
+        if w <= MAX_W and h <= MAX_H:
+            kept.append(name)
+        else:
+            print(f"Skipped huge image: {name} ({w}x{h})")
+            skipped += 1
+    return kept, skipped
+
+
 # ── Dataset ───────────────────────────────────────────────────────────────────
 class FloorSegDataset(Dataset):
-    def __init__(self, split: str, transform=None):
+    def __init__(self, split: str, transform=None, names: list[str] | None = None):
         self.img_dir  = DATA_ROOT / "images" / split
         self.mask_dir = DATA_ROOT / "masks"  / split
-        self.names    = sorted(f.name for f in self.img_dir.glob("*.png"))
+        # If a pre-filtered names list is supplied, use it; otherwise discover all PNGs.
+        self.names    = names if names is not None else sorted(f.name for f in self.img_dir.glob("*.png"))
         self.transform = transform
 
     def __len__(self):
@@ -233,26 +263,12 @@ def build_model():
     return model.to(DEVICE)
 
 
-# ── Metrics ───────────────────────────────────────────────────────────────────
-def compute_iou(preds: torch.Tensor, targets: torch.Tensor, num_classes=2):
-    """Mean IoU over valid classes."""
-    ious = []
-    for c in range(num_classes):
-        pred_c   = (preds   == c)
-        target_c = (targets == c)
-        intersection = (pred_c & target_c).sum().float()
-        union        = (pred_c | target_c).sum().float()
-        if union == 0:
-            continue
-        ious.append((intersection / union).item())
-    return float(np.mean(ious)) if ious else 0.0
-
-
 # ── Train / Eval loops ────────────────────────────────────────────────────────
 def run_epoch(model, loader, optimizer, criterion, is_train: bool):
     model.train(is_train)
     total_loss = 0.0
-    all_preds, all_targets = [], []
+    intersections = np.zeros(NUM_LABELS)
+    unions        = np.zeros(NUM_LABELS)
 
     phase = "Train" if is_train else "Val"
     pbar = tqdm(loader, desc=phase, leave=False, unit="batch")
@@ -283,15 +299,18 @@ def run_epoch(model, loader, optimizer, criterion, is_train: bool):
             total_loss += loss.item()
             pbar.set_postfix(loss=f"{loss.item():.4f}", avg=f"{total_loss / (pbar.n + 1):.4f}")
 
-            preds = upsampled.argmax(dim=1)  # (B,H,W)
+            preds = upsampled.argmax(dim=1).cpu().numpy()  # (B,H,W)
+            tgts  = masks.cpu().numpy()                    # (B,H,W)
 
-            all_preds.append(preds.cpu())
-            all_targets.append(masks.cpu())
+            for c in range(NUM_LABELS):
+                pred_c   = (preds == c)
+                target_c = (tgts  == c)
+                intersections[c] += (pred_c & target_c).sum()
+                unions[c]        += (pred_c | target_c).sum()
 
     avg_loss = total_loss / len(loader)
-    preds_cat   = torch.cat(all_preds)
-    targets_cat = torch.cat(all_targets)
-    iou = compute_iou(preds_cat, targets_cat, NUM_LABELS)
+    valid = unions > 0
+    iou = float(np.mean(intersections[valid] / unions[valid])) if valid.any() else 0.0
     return avg_loss, iou
 
 
@@ -319,9 +338,24 @@ def save_curves(train_losses, val_losses, val_ious):
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    # ── Filter huge images before building datasets ────────────────────────────
+    # Filenames are identical for images and masks, so a single names list keeps
+    # both directories in sync.  No separate mask list → no index mismatch risk.
+    train_img_dir = DATA_ROOT / "images" / "train"
+    val_img_dir   = DATA_ROOT / "images" / "val"
+
+    train_all = sorted(f.name for f in train_img_dir.glob("*.png"))
+    val_all   = sorted(f.name for f in val_img_dir.glob("*.png"))
+
+    train_names, train_skipped = filter_huge_images(train_img_dir, train_all)
+    val_names,   val_skipped   = filter_huge_images(val_img_dir,   val_all)
+
+    print(f"Train: skipped {train_skipped} huge image(s), kept {len(train_names)}/{len(train_all)}")
+    print(f"Val  : skipped {val_skipped}   huge image(s), kept {len(val_names)}/{len(val_all)}")
+
     # Datasets & loaders
-    train_ds = FloorSegDataset("train", get_transforms("train"))
-    val_ds   = FloorSegDataset("val",   get_transforms("val"))
+    train_ds = FloorSegDataset("train", get_transforms("train"), names=train_names)
+    val_ds   = FloorSegDataset("val",   get_transforms("val"),   names=val_names)
     print(f"Train: {len(train_ds)} samples | Val: {len(val_ds)} samples")
 
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,

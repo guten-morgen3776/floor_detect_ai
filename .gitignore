@@ -10,3 +10,6 @@ cubicasa_segment/
 archive*/
 archive (1)/
 *.zip
+
+# モデルの重みファイルを除外
+*.pth
