@@ -1,14 +1,16 @@
 """
-predict04.py  -  Two-stage segmentation inference
+predict05.py  -  Two-stage segmentation inference with TTA
 
 Stage 1 (Coarse):  train01 weights (SegFormer-b3)
                    Full image resized to 512x512 → global room/background mask
+                   TTA: 4 rotations (0°, 90°, 180°, 270°), logits averaged
 Stage 2 (Fine):    train03 weights (SegFormer-b2)
                    Sliding window (PATCH_SIZE=1024, STRIDE=512) within coarse-mask ROI only
+                   TTA: 4 rotations (0°, 90°, 180°, 270°), logits averaged
 Fusion:            fine mask result inside ROI, forced background outside ROI
 
 Usage:
-    python predict04.py <input_dir> [--coarse <path>] [--fine <path>] [--output <dir>]
+    python predict05.py <input_dir> [--coarse <path>] [--fine <path>] [--output <dir>]
                         [--patch-size {768,1024}] [--dilate-px <int>]
 """
 
@@ -42,11 +44,11 @@ NUM_LABELS      = 2
 if IS_KAGGLE:
     DEFAULT_COARSE_WEIGHTS = Path("/kaggle/working/exp01/best_model.pth")
     DEFAULT_FINE_WEIGHTS   = Path("/kaggle/working/exp03/best_model.pth")
-    DEFAULT_OUTPUT_DIR     = Path("/kaggle/working/predict04")
+    DEFAULT_OUTPUT_DIR     = Path("/kaggle/working/predict05")
 else:
     DEFAULT_COARSE_WEIGHTS = Path("/content/drive/MyDrive/exp01/best_model.pth")
     DEFAULT_FINE_WEIGHTS   = Path("/content/drive/MyDrive/exp03/best_model.pth")
-    DEFAULT_OUTPUT_DIR     = Path("/content/drive/MyDrive/predict04")
+    DEFAULT_OUTPUT_DIR     = Path("/content/drive/MyDrive/predict05")
 
 COARSE_SIZE        = 512    # train01の学習サイズ
 DEFAULT_PATCH_SIZE = 1024   # 細推論パッチサイズ (768 or 1024)
@@ -79,11 +81,12 @@ def build_model(model_id: str, weights_path: Path) -> nn.Module:
 
 
 # ─────────────────────────────────────────────
-# Stage 1: Coarse inference
+# Stage 1: Coarse inference (TTA)
 # ─────────────────────────────────────────────
 def coarse_predict(model: nn.Module, image_rgb: np.ndarray) -> np.ndarray:
     """
-    全体を512×512にリサイズして推論し、元解像度のバイナリマスク(0/1)を返す。
+    TTA: 0°・90°・180°・270° の4枚を推論し、roomロジットを平均して
+    元解像度のバイナリマスク(0/1)を返す。
 
     Args:
         model     : train01モデル (SegFormer-b3, eval mode)
@@ -93,18 +96,29 @@ def coarse_predict(model: nn.Module, image_rgb: np.ndarray) -> np.ndarray:
         mask (H, W) uint8 — 1=room, 0=background
     """
     H, W = image_rgb.shape[:2]
+    avg_logit = np.zeros((H, W), dtype=np.float32)
 
-    resized = A.Resize(COARSE_SIZE, COARSE_SIZE)(image=image_rgb)["image"]
-    tensor  = NORMALIZE(image=resized)["image"].unsqueeze(0).to(DEVICE)  # (1,3,512,512)
+    for k in range(4):  # k=0:0°, k=1:90°CCW, k=2:180°, k=3:270°CCW
+        rot_img = np.rot90(image_rgb, k=k)
+        rot_H, rot_W = rot_img.shape[:2]
 
-    with torch.no_grad():
-        logits = model(pixel_values=tensor).logits  # (1,2,128,128)
-        up = nn.functional.interpolate(
-            logits, size=(H, W), mode="bilinear", align_corners=False
-        )
-        mask = up.argmax(dim=1).squeeze(0).cpu().numpy()  # (H,W)
+        resized = A.Resize(COARSE_SIZE, COARSE_SIZE)(image=rot_img)["image"]
+        tensor  = NORMALIZE(image=resized)["image"].unsqueeze(0).to(DEVICE)
 
-    return mask.astype(np.uint8)
+        with torch.no_grad():
+            logits = model(pixel_values=tensor).logits  # (1,2,128,128)
+            up = nn.functional.interpolate(
+                logits, size=(rot_H, rot_W), mode="bilinear", align_corners=False
+            )
+            room_logit = up[0, 1].cpu().numpy()  # (rot_H, rot_W)
+
+        # 逆回転して元の向きに戻す
+        back_logit = np.rot90(room_logit, k=(4 - k) % 4)
+        avg_logit += back_logit
+
+    avg_logit /= 4
+    mask = (avg_logit > 0).astype(np.uint8)
+    return mask
 
 
 # ─────────────────────────────────────────────
@@ -136,9 +150,9 @@ def make_hann_window(size: int) -> np.ndarray:
 
 
 # ─────────────────────────────────────────────
-# Stage 2: Fine inference (ROI内のみ)
+# Stage 2: Fine inference の内部実装 (1回転分)
 # ─────────────────────────────────────────────
-def fine_predict_in_roi(
+def _fine_predict_logits_in_roi(
     model: nn.Module,
     image_rgb: np.ndarray,
     roi_mask: np.ndarray,
@@ -146,8 +160,9 @@ def fine_predict_in_roi(
     stride: int,
 ) -> np.ndarray:
     """
-    ROIと重なるパッチのみスライディングウィンドウ推論を実行。
-    Hann窓で重み付け加算し、ROIと重ならないパッチはスキップする。
+    ROIと重なるパッチのみスライディングウィンドウ推論を実行し、
+    Hann窓で重み付け平均したロジットマップ (H, W) を返す。
+    (TTA用内部関数。閾値処理はしない。)
 
     Args:
         model      : train03モデル (SegFormer-b2, eval mode)
@@ -157,7 +172,7 @@ def fine_predict_in_roi(
         stride     : スライディングウィンドウのストライド
 
     Returns:
-        fine_mask (H, W) uint8 — 1=room, 0=background
+        avg_logit (H, W) float32 — roomロジット平均値 (ROIなし領域は -999.0)
     """
     H, W = image_rgb.shape[:2]
 
@@ -220,12 +235,54 @@ def fine_predict_in_roi(
     print(f"  Patches: {executed}/{total_patches} executed "
           f"({total_patches - executed} skipped by ROI filter)")
 
-    # ── 平均・閾値処理 ────────────────────────────────────────────────────
     # weight_sum=0 の領域 (ROIスキップ箇所) は -999 にして background 扱い
     avg_logit = np.where(weight_sum > 0, logit_sum / weight_sum, -999.0)
-    fine_mask = (avg_logit > 0).astype(np.uint8)  # logit>0 ↔ prob>0.5
+    return avg_logit[:H, :W]
 
-    return fine_mask[:H, :W]
+
+# ─────────────────────────────────────────────
+# Stage 2: Fine inference (ROI内のみ、TTA)
+# ─────────────────────────────────────────────
+def fine_predict_in_roi(
+    model: nn.Module,
+    image_rgb: np.ndarray,
+    roi_mask: np.ndarray,
+    patch_size: int,
+    stride: int,
+) -> np.ndarray:
+    """
+    TTA: 0°・90°・180°・270° の4枚に対してスライディングウィンドウ推論を行い、
+    各推論結果を元の向きに逆回転した後、ロジットを平均して最終マスクを返す。
+
+    Args:
+        model      : train03モデル (SegFormer-b2, eval mode)
+        image_rgb  : uint8 RGB画像 (H, W, 3)
+        roi_mask   : uint8 ROIマスク (H, W) — 1=推論対象
+        patch_size : スライディングウィンドウのパッチサイズ (768 or 1024)
+        stride     : スライディングウィンドウのストライド
+
+    Returns:
+        fine_mask (H, W) uint8 — 1=room, 0=background
+    """
+    H, W = image_rgb.shape[:2]
+    avg_logit = np.zeros((H, W), dtype=np.float32)
+
+    for k in range(4):  # k=0:0°, k=1:90°CCW, k=2:180°, k=3:270°CCW
+        print(f"    TTA rotation {k * 90}°…")
+        rot_img = np.rot90(image_rgb, k=k)
+        rot_roi = np.rot90(roi_mask,  k=k)
+
+        rot_logit = _fine_predict_logits_in_roi(
+            model, rot_img, rot_roi, patch_size, stride
+        )
+
+        # 逆回転して元の向きに戻す
+        back_logit = np.rot90(rot_logit, k=(4 - k) % 4)
+        avg_logit += back_logit
+
+    avg_logit /= 4
+    fine_mask = (avg_logit > 0).astype(np.uint8)  # logit>0 ↔ prob>0.5
+    return fine_mask
 
 
 # ─────────────────────────────────────────────
@@ -281,7 +338,7 @@ def save_results(
 # ─────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
-        description="Two-stage segmentation inference (coarse=train01, fine=train03)"
+        description="Two-stage segmentation inference with TTA (coarse=train01, fine=train03)"
     )
     parser.add_argument("input_dir", type=str,
                         help="Directory containing input floor plan images")
@@ -332,6 +389,7 @@ def main():
     stride = args.stride if args.stride is not None else args.patch_size // 2
     print(f"Patch size   : {args.patch_size}  Stride: {stride}")
     print(f"Dilate px    : {args.dilate_px}")
+    print(f"TTA          : 4 rotations (0°, 90°, 180°, 270°)")
 
     # ── モデルロード (1回だけ) ─────────────────────────────────────────────
     print("\nLoading coarse model…")
@@ -347,8 +405,8 @@ def main():
         H, W = image_rgb.shape[:2]
         print(f"  Image size : {W}×{H}")
 
-        # Stage 1: 粗推論
-        print("  [Stage 1] Coarse inference…")
+        # Stage 1: 粗推論 (TTA)
+        print("  [Stage 1] Coarse inference (TTA)…")
         coarse_mask = coarse_predict(coarse_model, image_rgb)
         room_ratio  = coarse_mask.mean()
         print(f"  Coarse room coverage: {room_ratio:.1%}")
@@ -358,8 +416,8 @@ def main():
         roi_ratio = roi_mask.mean()
         print(f"  ROI coverage (after dilate): {roi_ratio:.1%}")
 
-        # Stage 2: 細推論 (ROI内のみ)
-        print(f"  [Stage 2] Fine inference (patch={args.patch_size}, stride={stride})…")
+        # Stage 2: 細推論 (ROI内のみ、TTA)
+        print(f"  [Stage 2] Fine inference with TTA (patch={args.patch_size}, stride={stride})…")
         fine_mask = fine_predict_in_roi(
             fine_model, image_rgb, roi_mask, patch_size=args.patch_size, stride=stride
         )
