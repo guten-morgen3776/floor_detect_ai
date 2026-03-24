@@ -40,15 +40,10 @@ from pathlib import Path
 from collections import defaultdict
 
 import torch
-import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from tqdm import tqdm
-
-from pycocotools import mask as mask_utils
-from pycocotools.coco import COCO
-from pycocotools.cocoeval import COCOeval
 
 from accelerate import Accelerator
 
@@ -103,12 +98,12 @@ LABEL2ID        = {"room": 0}
 # ── Differential LR ──────────────────────────────────────────────────────────
 # Backbone (Swin encoder) の学習率は head の BACKBONE_LR_SCALE 倍にする。
 # 事前学習済みの特徴量を維持しつつ、新しい head を素早く最適化するため。
-BACKBONE_LR_SCALE = 0.1     # backbone LR = lr * BACKBONE_LR_SCALE
+BACKBONE_LR_SCALE = 0.2     # backbone LR = lr * BACKBONE_LR_SCALE
 
 # ── Warmup ───────────────────────────────────────────────────────────────────
 # Linear warmup: 学習率を WARMUP_START_FACTOR * lr から lr まで線形に増加させる。
 # 学習開始直後の大きな勾配による重みの破壊を防ぐ。
-WARMUP_EPOCHS       = 5     # warmup のエポック数
+WARMUP_EPOCHS       = 2    # warmup のエポック数
 WARMUP_START_FACTOR = 0.1   # epoch 0 での学習率倍率 (最終的に 1.0 まで線形増加)
 
 
@@ -556,121 +551,6 @@ def save_curves(train_losses: list[float], val_losses: list[float]) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# mAP evaluation
-# ─────────────────────────────────────────────────────────────────────────────
-def evaluate_map(
-    model,
-    val_items: list[dict],
-    accelerator: Accelerator,
-    threshold: float = 0.5,
-) -> float:
-    """Instance segmentation mAP (AP@0.5:0.95) を pycocotools で計算する。
-
-    GT・予測ともに val transform 後の 1024×1024 空間で評価する。
-    メインプロセスのみで推論・集計を実行し、非メインプロセスは 0.0 を返す。
-    """
-    if not accelerator.is_main_process:
-        return 0.0
-
-    unwrapped = accelerator.unwrap_model(model)
-    unwrapped.eval()
-    device = accelerator.device
-
-    # 評価専用の非 DDP DataLoader (batch_size=1 固定)
-    eval_ds     = CubiCasaInstanceDataset(val_items, IMG_DIR_VAL, get_transforms("val"))
-    eval_loader = DataLoader(
-        eval_ds, batch_size=1, shuffle=False, num_workers=2, collate_fn=collate_fn
-    )
-
-    gt_images:      list[dict] = []
-    gt_annotations: list[dict] = []
-    dt_results:     list[dict] = []
-    ann_id = 1
-
-    for image_id, batch in enumerate(
-        tqdm(eval_loader, desc="mAP eval", leave=False, unit="img"), start=1
-    ):
-        pixel_values   = batch["pixel_values"].to(device)   # (1, 3, H, W)
-        mask_labels_b  = batch["mask_labels"][0].cpu()      # (N, H, W) float32
-        class_labels_b = batch["class_labels"][0].cpu()     # (N,)
-
-        H, W = pixel_values.shape[2], pixel_values.shape[3]
-
-        # ── GT を COCO 形式で収集 ─────────────────────────────────────────────
-        gt_images.append({"id": image_id, "height": H, "width": W})
-        for n in range(mask_labels_b.shape[0]):
-            binary = mask_labels_b[n].numpy().astype(np.uint8)
-            if binary.sum() == 0:
-                continue
-            rle = mask_utils.encode(np.asfortranarray(binary))
-            rle["counts"] = rle["counts"].decode("utf-8")
-            ys, xs = np.where(binary)
-            gt_annotations.append({
-                "id":           ann_id,
-                "image_id":     image_id,
-                "category_id":  int(class_labels_b[n].item()) + 1,  # 1-indexed
-                "segmentation": rle,
-                "area":         int(binary.sum()),
-                "bbox":         [int(xs.min()), int(ys.min()),
-                                 int(xs.max() - xs.min()), int(ys.max() - ys.min())],
-                "iscrowd":      0,
-            })
-            ann_id += 1
-
-        # ── 推論 ──────────────────────────────────────────────────────────────
-        with torch.no_grad():
-            outputs = unwrapped(pixel_values=pixel_values)
-
-        # class_queries_logits: (1, Q, num_labels+1)  最後の次元が no-object
-        class_probs = torch.softmax(outputs.class_queries_logits, dim=-1)
-        scores = class_probs[0, :, :-1].max(dim=-1).values.cpu()  # (Q,)
-
-        # masks_queries_logits: (1, Q, H//4, W//4) → sigmoid → upsample
-        mask_probs = torch.sigmoid(outputs.masks_queries_logits)
-        mask_probs = F.interpolate(
-            mask_probs, size=(H, W), mode="bilinear", align_corners=False
-        )
-        mask_probs = mask_probs[0].cpu()  # (Q, H, W)
-
-        for q in (scores >= threshold).nonzero(as_tuple=True)[0].tolist():
-            binary = (mask_probs[q] > 0.5).numpy().astype(np.uint8)
-            if binary.sum() == 0:
-                continue
-            rle = mask_utils.encode(np.asfortranarray(binary))
-            rle["counts"] = rle["counts"].decode("utf-8")
-            ys, xs = np.where(binary)
-            dt_results.append({
-                "image_id":     image_id,
-                "category_id":  1,
-                "segmentation": rle,
-                "score":        float(scores[q]),
-                "bbox":         [int(xs.min()), int(ys.min()),
-                                 int(xs.max() - xs.min()), int(ys.max() - ys.min())],
-                "area":         int(binary.sum()),
-            })
-
-    # ── pycocotools で mAP 計算 ───────────────────────────────────────────────
-    if not dt_results:
-        return 0.0
-
-    coco_gt = COCO()
-    coco_gt.dataset = {
-        "images":      gt_images,
-        "annotations": gt_annotations,
-        "categories":  [{"id": 1, "name": "room"}],
-    }
-    coco_gt.createIndex()
-
-    coco_dt   = coco_gt.loadRes(dt_results)
-    coco_eval = COCOeval(coco_gt, coco_dt, "segm")
-    coco_eval.evaluate()
-    coco_eval.accumulate()
-    coco_eval.summarize()
-
-    return float(coco_eval.stats[0])   # AP@[0.5:0.95]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 def main() -> None:
@@ -759,14 +639,14 @@ def main() -> None:
     )
 
     # ── Training loop ─────────────────────────────────────────────────────────
-    best_map       = 0.0
+    best_val_loss  = float("inf")
     patience_count = 0
     train_losses: list[float] = []
     val_losses:   list[float] = []
 
     if accelerator.is_main_process:
-        print(f"\n{'Epoch':>6}  {'TrainLoss':>10}  {'ValLoss':>9}  {'mAP':>7}  {'LR(head)':>10}  {'Time':>7}")
-        print("-" * 62)
+        print(f"\n{'Epoch':>6}  {'TrainLoss':>10}  {'ValLoss':>9}  {'LR(head)':>10}  {'Time':>7}")
+        print("-" * 52)
 
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
@@ -774,9 +654,6 @@ def main() -> None:
         tr_loss  = run_epoch(model, train_loader, optimizer, accelerator, is_train=True)
         val_loss = run_epoch(model, val_loader,   optimizer, accelerator, is_train=False)
         scheduler.step()
-
-        # mAP はメインプロセスのみで計算（非メインは 0.0 が返る）
-        map_score = evaluate_map(model, val_items, accelerator)
 
         train_losses.append(tr_loss)
         val_losses.append(val_loss)
@@ -787,16 +664,16 @@ def main() -> None:
         if accelerator.is_main_process:
             # param_groups[1] が head / decoder (base lr) のグループ
             current_lr = optimizer.param_groups[1]["lr"]
-            print(f"{epoch:>6}  {tr_loss:>10.4f}  {val_loss:>9.4f}  {map_score:>7.4f}  {current_lr:>10.2e}  {elapsed:>6.1f}s")
+            print(f"{epoch:>6}  {tr_loss:>10.4f}  {val_loss:>9.4f}  {current_lr:>10.2e}  {elapsed:>6.1f}s")
 
             unwrapped = accelerator.unwrap_model(model)
             torch.save(unwrapped.state_dict(), LAST_MODEL)
 
-            if map_score > best_map:
-                best_map       = map_score
+            if val_loss < best_val_loss:
+                best_val_loss  = val_loss
                 patience_count = 0
                 torch.save(unwrapped.state_dict(), BEST_MODEL)
-                print(f"         *** New best mAP={best_map:.4f}  → {BEST_MODEL}")
+                print(f"         *** New best val loss={best_val_loss:.4f}  → {BEST_MODEL}")
             else:
                 patience_count += 1
                 if patience_count >= args.early_stop:
@@ -805,7 +682,7 @@ def main() -> None:
 
     if accelerator.is_main_process:
         save_curves(train_losses, val_losses)
-        print(f"\nDone.  Best mAP: {best_map:.4f}")
+        print(f"\nDone.  Best val loss: {best_val_loss:.4f}")
         print(f"Best model : {BEST_MODEL}")
         print(f"Last model : {LAST_MODEL}")
 
