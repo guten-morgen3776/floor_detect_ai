@@ -125,7 +125,7 @@ def preprocess(
             min_height=IMG_SIZE,
             min_width=IMG_SIZE,
             border_mode=0,
-            value=0,
+            fill=0,           # albumentations >= 2.0 では value → fill
         ),
     ])
     resized = letterbox(image=image_rgb)["image"]

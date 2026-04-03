@@ -84,7 +84,7 @@ def run_split(model, img_dir: Path, pred_dir: Path, skip_existing: bool) -> None
     print(f"  {len(stems)} 枚の画像を処理します: {img_dir}")
     total_instances = 0
 
-    for stem in tqdm(stems, desc=f"  {img_dir.name}"):
+    for stem in tqdm(stems, desc=f"  推論 ({img_dir.name})"):
         img_path = img_dir / f"{stem}.png"
         out_path = pred_dir / f"{stem}_pred.npz"
 
@@ -93,6 +93,7 @@ def run_split(model, img_dir: Path, pred_dir: Path, skip_existing: bool) -> None
 
         n = process_image(model, img_path, out_path)
         total_instances += n
+
 
     print(f"  完了: 合計 {total_instances:,} インスタンス保存")
 
