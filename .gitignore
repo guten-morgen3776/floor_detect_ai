@@ -6,7 +6,7 @@ my_cubicasa_dataset/
 cubicasa5k_pix2pix/
 cubicasa_segment/
 cubicasa_mask2former/
-cubicasa_instance
+cubicasa_instance/
 
 # 大量データ・アーカイブ（pushしない）
 archive*/
