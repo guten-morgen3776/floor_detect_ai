@@ -8,6 +8,8 @@ cubicasa_segment/
 cubicasa_mask2former/
 cubicasa_instance/
 panasonic-floor-plan/
+floor-plan-layout-detection/
+Floor Plans/
 
 # 大量データ・アーカイブ（pushしない）
 archive*/
