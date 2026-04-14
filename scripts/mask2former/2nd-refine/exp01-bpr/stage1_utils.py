@@ -165,32 +165,54 @@ def predict_instances(
 
     mask_logits    = outputs.masks_queries_logits[0]
     mask_probs     = mask_logits.sigmoid()
+    del outputs  # 中間出力を即解放
 
+    # ── Step1: 1024×1024 にアップサンプリング ─────────────────────────────────
     mask_probs_lb = F.interpolate(
         mask_probs.unsqueeze(0),
         size=(IMG_SIZE, IMG_SIZE),
         mode="bilinear",
         align_corners=False,
     )[0]
+    del mask_probs  # アップサンプリング後は不要
 
+    # ── Step2: パディング除去 ──────────────────────────────────────────────────
+    # .clone() でビューを切り、直後に mask_probs_lb を解放できるようにする
     mask_probs_cropped = mask_probs_lb[
         :,
         pad_top : pad_top + scaled_H,
         pad_left: pad_left + scaled_W,
-    ]
+    ].clone()
+    del mask_probs_lb  # ビューを断ち切ったので解放可能
+
+    # ── Step3: confidence フィルタを先に適用してクエリ数を削減 ─────────────────
+    # 全クエリを元解像度にアップサンプリングするとメモリが爆発するため、
+    # 閾値を超えたクエリのみを orig_H×orig_W にアップサンプリングする。
+    keep = (scores >= threshold).cpu()
+
+    filtered_scores = scores[keep].cpu().tolist()
+    filtered_labels = pred_labels[keep].cpu().tolist()
+
+    if keep.sum() == 0:
+        del mask_probs_cropped
+        torch.cuda.empty_cache()
+        return np.zeros((0, orig_H, orig_W), dtype=bool), [], []
+
+    # ── Step4: 残ったマスクだけ元解像度にアップサンプリング ──────────────────
+    kept_probs = mask_probs_cropped[keep.to(mask_probs_cropped.device)]  # (N, sH, sW)
+    del mask_probs_cropped  # フィルタ後は不要
 
     mask_probs_full = F.interpolate(
-        mask_probs_cropped.unsqueeze(0),
+        kept_probs.unsqueeze(0),
         size=(orig_H, orig_W),
         mode="bilinear",
         align_corners=False,
-    )[0]
+    )[0]                                                                  # (N, H, W)
+    del kept_probs  # アップサンプリング後は不要
 
-    keep = (scores >= threshold).cpu()
-
-    filtered_scores  = scores[keep].cpu().tolist()
-    filtered_labels  = pred_labels[keep].cpu().tolist()
-    filtered_masks   = (mask_probs_full[keep] > 0.5).cpu().numpy()
+    filtered_masks = (mask_probs_full > 0.5).cpu().numpy()               # (N, H, W) bool
+    del mask_probs_full
+    torch.cuda.empty_cache()
 
     return filtered_masks, filtered_scores, filtered_labels
 
@@ -210,16 +232,17 @@ def apply_morphology(masks: np.ndarray) -> np.ndarray:
         (MORPH_CLOSING_KERNEL_SIZE, MORPH_CLOSING_KERNEL_SIZE),
     )
 
-    processed = []
-    for m in masks:
+    # リストを使わず事前割り当てして余分な (N,H,W) コピーを削減
+    result = np.empty_like(masks)
+    for i, m in enumerate(masks):
         m_uint8 = m.astype(np.uint8) * 255
         m_uint8 = cv2.morphologyEx(m_uint8, cv2.MORPH_OPEN,  kernel_open,
                                    iterations=MORPH_OPENING_ITERATIONS)
         m_uint8 = cv2.morphologyEx(m_uint8, cv2.MORPH_CLOSE, kernel_close,
                                    iterations=MORPH_CLOSING_ITERATIONS)
-        processed.append(m_uint8 > 0)
+        result[i] = m_uint8 > 0
 
-    return np.stack(processed, axis=0) if len(processed) > 0 else masks
+    return result
 
 
 def resolve_overlaps_by_area(masks: np.ndarray) -> np.ndarray:
@@ -235,13 +258,17 @@ def resolve_overlaps_by_area(masks: np.ndarray) -> np.ndarray:
     if not overlap.any():
         return masks
 
-    resolved = masks.copy()
-    area_map = masks.astype(np.float32) * areas[:, np.newaxis, np.newaxis]
-    best     = area_map.argmax(axis=0)
+    # (N,H,W) float32 の area_map を避け、(H,W) int32 の winner マップに置き換える
+    # → ピーク RAM を N 分の 1 に削減（例: N=20 なら 960 MB → 48 MB）
+    order  = np.argsort(areas)                                  # 面積昇順のインデックス
+    winner = np.full(masks.shape[1:], -1, dtype=np.int32)      # (H, W) のみ
+    for i in order:
+        winner[overlap & masks[i]] = i                          # 大きい面積で上書き
 
+    resolved = masks.copy()
     resolved[:, overlap] = False
     for i in range(len(masks)):
-        resolved[i][overlap & (best == i)] = True
+        resolved[i][overlap & (winner == i)] = True
 
     return resolved
 

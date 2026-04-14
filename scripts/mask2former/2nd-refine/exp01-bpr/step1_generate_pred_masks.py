@@ -11,11 +11,14 @@ Usage:
     python step1_generate_pred_masks.py --split all
 """
 
+import gc
 import argparse
 import numpy as np
 from pathlib import Path
 from PIL import Image
 from tqdm import tqdm
+
+import torch
 
 import config
 import stage1_utils as s1
@@ -93,6 +96,8 @@ def run_split(model, img_dir: Path, pred_dir: Path, skip_existing: bool) -> None
 
         n = process_image(model, img_path, out_path)
         total_instances += n
+        torch.cuda.empty_cache()
+        gc.collect()
 
 
     print(f"  完了: 合計 {total_instances:,} インスタンス保存")
