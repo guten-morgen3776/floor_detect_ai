@@ -10,6 +10,8 @@ cubicasa_instance/
 panasonic-floor-plan/
 floor-plan-layout-detection/
 Floor Plans/
+mask2former_augmented_data/
+mask2former_augmented_data_50/
 
 # 大量データ・アーカイブ（pushしない）
 archive*/
